@@ -1,0 +1,142 @@
+name: Build and deploy Ticket a la Nube
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Run tests
+        run: ./mvnw -B clean verify
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/ticket-a-la-nube:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/ticket-a-la-nube:${{ github.sha }}
+
+  deploy-to-ec2:
+    needs: build-and-publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure SSH
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$EC2_SSH_KEY"
+          test -n "$EC2_KNOWN_HOSTS"
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$EC2_SSH_KEY" > "$HOME/.ssh/ec2_key"
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/ec2_key" "$HOME/.ssh/known_hosts"
+
+      - name: Send AWS configuration and deploy
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          USER_SERVER: ${{ secrets.USER_SERVER }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          EFS_ID: ${{ secrets.EFS_ID }}
+        run: |
+          set -euo pipefail
+          for name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION S3_BUCKET EC2_HOST USER_SERVER DOCKERHUB_USERNAME EFS_ID; do
+            if [ -z "${!name}" ]; then
+              echo "Required GitHub secret is missing: $name" >&2
+              exit 1
+            fi
+          done
+
+          image="${DOCKERHUB_USERNAME}/ticket-a-la-nube:${GITHUB_SHA}"
+          efs_dns="${EFS_ID}.efs.${AWS_REGION}.amazonaws.com"
+          efs_mount_path="/home/${USER_SERVER}/efs"
+          aws_env_file="$RUNNER_TEMP/ticket-a-la-nube.env"
+          trap 'rm -f "$aws_env_file"' EXIT
+
+          umask 077
+          printf '%s\n' \
+            "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" \
+            "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" \
+            "AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}" \
+            "AWS_REGION=${AWS_REGION}" \
+            "S3_BUCKET=${S3_BUCKET}" \
+            > "$aws_env_file"
+
+          scp -i "$HOME/.ssh/ec2_key" \
+            "$aws_env_file" \
+            "${USER_SERVER}@${EC2_HOST}:/tmp/ticket-a-la-nube.env"
+
+          ssh -i "$HOME/.ssh/ec2_key" "${USER_SERVER}@${EC2_HOST}" \
+            bash -s -- "$image" "$efs_dns" "$efs_mount_path" <<'REMOTE'
+          set -euo pipefail
+          image="$1"
+          efs_dns="$2"
+          efs_mount_path="$3"
+          aws_env_file=/tmp/ticket-a-la-nube.env
+          trap 'sudo rm -f "$aws_env_file"' EXIT
+          sudo chmod 600 "$aws_env_file"
+
+          sudo mkdir -p "$efs_mount_path"
+          if ! command -v mount.nfs4 >/dev/null 2>&1; then
+            if command -v dnf >/dev/null 2>&1; then
+              sudo dnf install -y nfs-utils
+            else
+              sudo yum install -y nfs-utils
+            fi
+          fi
+
+          if ! mountpoint -q "$efs_mount_path"; then
+            sudo mount -t nfs4 \
+              -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport \
+              "${efs_dns}:/" "$efs_mount_path"
+          fi
+          df -hT "$efs_mount_path"
+
+          sudo docker pull "$image"
+          if sudo docker inspect ticket-a-la-nube >/dev/null 2>&1; then
+            sudo docker rm -f ticket-a-la-nube
+          fi
+          sudo docker run -d \
+            --name ticket-a-la-nube \
+            --restart unless-stopped \
+            -p 8080:8080 \
+            -v "${efs_mount_path}:/app/efs" \
+            -e EFS_PATH=/app/efs \
+            --env-file "$aws_env_file" \
+            "$image"
+          sudo docker ps --filter name=ticket-a-la-nube
+          sudo docker logs --tail 30 ticket-a-la-nube
+          REMOTE
+
+          rm -f "$aws_env_file"
